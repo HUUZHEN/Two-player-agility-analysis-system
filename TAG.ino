@@ -1,240 +1,215 @@
-#include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
+#define RXD2 16
+#define TXD2 17
+
 // WiFi 設定
-const char* ssid = "usb_lab_2.4G";        // 替換為你的 WiFi 名稱
-const char* password = "usblabwifi"; // 替換為你的 WiFi 密碼
+const char* ssid = "usb_lab_2.4G";      // <<< 你的 WiFi SSID
+const char* password = "usblabwifi";    // <<< 你的 WiFi 密碼
 
 // UDP 設定
+const char* udpAddress = "192.168.1.28"; // <<< 電腦 IP
+const int udpPort = 4210;
+
 WiFiUDP udp;
-const char* udp_address = "192.168.1.28";  // 替換為你電腦的 IP 地址
-const int udp_port = 4210;
 
-// UWB 模組設置
-String DATA = "";
-int UWB_MODE = 0;  // 0: Tag mode
-int UWB_T_NUMBER = 0;
+// 暫存距離資料
+float dist0 = 0, dist1 = 0, dist2 = 0;
+bool gotDist0 = false, gotDist1 = false, gotDist2 = false;
 
-// Anchor 座標（單位：公尺）
-float anchor_coords[3][2] = {
-  {0.0, 0.0},    // Anchor 0
-  {2.0, 0.0},    // Anchor 1
-  {1.0, 1.732}   // Anchor 2
-};
-
-// Tag 座標
-float tag_x = 0.0, tag_y = 0.0;
-
-// 平滑濾波
-float smoothed_distances[3] = {0.0, 0.0, 0.0};
-void smooth_distances(float new_dist[3]) {
-  for (int i = 0; i < 3; i++) {
-    smoothed_distances[i] = 0.3 * smoothed_distances[i] + 0.7 * new_dist[i];
-  }
-}
-
-// 三角定位函數
-void calculate_tag_position(float d0, float d1, float d2) {
-  float x1 = anchor_coords[1][0], y1 = anchor_coords[1][1];
-  float x2 = anchor_coords[2][0], y2 = anchor_coords[2][1];
-
-  tag_x = (d0 * d0 - d1 * d1 + x1 * x1) / (2 * x1);
-  tag_y = (d0 * d0 - d2 * d2 + x2 * x2 + y2 * y2) / (2 * y2) - (x2 / y2) * tag_x;
-
-  // 邊界檢查
-  if (isnan(tag_x) || isnan(tag_y) || tag_x < -0.5 || tag_x > 2.5 || tag_y < -0.5 || tag_y > 2.5) {
-    tag_x = 1.0;  // 預設位置
-    tag_y = 1.0;
-  }
-}
-
-// WiFi 連接函數
-void setup_wifi() {
-  WiFi.begin(ssid, password);
-  Serial.print("連接 WiFi");
+// 傳送指令並等待回應
+bool sendCommandAndWait(String command, String expectedResponse, int timeout = 2000) {
+  Serial.println("🔧 傳送指令: " + command);
+  Serial2.print(command + "\r\n");  // 使用 \r\n 結尾
   
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
+  unsigned long startTime = millis();
+  String response = "";
   
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println();
-    Serial.println("WiFi 連接成功!");
-    Serial.print("IP 地址: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println();
-    Serial.println("WiFi 連接失敗!");
-  }
-}
-
-// 發送 UDP 數據
-void send_udp_data() {
-  if (WiFi.status() == WL_CONNECTED) {
-    udp.beginPacket(udp_address, udp_port);
-    
-    // 構建 JSON 數據
-    String json_data = "{\"tag_x\":";
-    json_data += String(tag_x, 2);
-    json_data += ",\"tag_y\":";
-    json_data += String(tag_y, 2);
-    json_data += ",\"distances\":[";
-    json_data += String(smoothed_distances[0], 2) + ",";
-    json_data += String(smoothed_distances[1], 2) + ",";
-    json_data += String(smoothed_distances[2], 2);
-    json_data += "]}";
-    
-    udp.print(json_data);
-    udp.endPacket();
-    
-    Serial.println("發送: " + json_data);
-  } else {
-    Serial.println("WiFi 未連接，無法發送數據");
-  }
-}
-
-// 讀取 UWB 數據
-void UWB_readString() {
-  if (Serial2.available()) {
-    DATA = "";
-    unsigned long start_time = millis();
-    while (millis() - start_time < 100) {
-      if (Serial2.available()) {
-        DATA += Serial2.readStringUntil('\n');
+  while (millis() - startTime < timeout) {
+    while (Serial2.available()) {
+      char c = Serial2.read();
+      if (c >= 32 && c <= 126) {  // 只接受可印字元
+        response += c;
+      } else if (c == '\n' || c == '\r') {
+        response += '\n';
       }
     }
-
-    Serial.println("UWB 原始數據: " + DATA);
-
-    // 解析距離數據
-    float distances[3];
-    bool valid_data = true;
-    UWB_T_NUMBER = 0;
     
-    for (int i = 0; i < 3; i++) {
-      String anchor_id = "an" + String(i) + ":";
-      int start_idx = DATA.indexOf(anchor_id);
-      if (start_idx != -1) {
-        int end_idx = DATA.indexOf("m", start_idx);
-        if (end_idx != -1) {
-          String dist_str = DATA.substring(start_idx + 4, end_idx);
-          distances[i] = dist_str.toFloat();
-          if (distances[i] <= 0 || distances[i] > 5) {
-            valid_data = false;
-          }
-          UWB_T_NUMBER++;
-        } else {
-          valid_data = false;
-        }
-      } else {
-        valid_data = false;
-      }
+    // 檢查是否包含期望的回應
+    if (response.indexOf(expectedResponse) >= 0) {
+      response.trim();
+      Serial.println("✅ 回應: " + response);
+      return true;
     }
-
-    if (valid_data && UWB_T_NUMBER >= 3) {
-      smooth_distances(distances);
-      calculate_tag_position(smoothed_distances[0], smoothed_distances[1], smoothed_distances[2]);
-      
-      // 通過 WiFi 發送數據到電腦
-      send_udp_data();
-    } else {
-      Serial.println("數據無效，跳過");
-      // 即使數據無效也發送一個錯誤信息（用於測試）
-      if (WiFi.status() == WL_CONNECTED) {
-        udp.beginPacket(udp_address, udp_port);
-        udp.print("{\"error\":\"Invalid UWB data\"}");
-        udp.endPacket();
-      }
-    }
+    delay(10);
   }
-}
-
-// 設置 UWB 模組
-void UWB_setupmode() {
-  Serial.println("設置 UWB 模組為 Tag 模式...");
-  for (int b = 0; b < 2; b++) {
-    delay(50);
-    Serial2.println("AT+anchor_tag=0\r\n");
-    delay(50);
-    Serial2.println("AT+interval=1\r\n");
-    delay(50);
-    Serial2.println("AT+switchdis=1\r\n");
-    delay(50);
-    if (b == 0) {
-      Serial2.println("AT+RST\r\n");
-      delay(1000);  // 等待重啟
-    }
-  }
-  Serial.println("UWB 設置完成");
-}
-
-// 測試函數：發送假數據（用於測試連接）
-void send_test_data() {
-  static float test_x = 1.0;
-  static float test_y = 1.0;
-  static float direction_x = 0.1;
-  static float direction_y = 0.05;
   
-  // 模擬移動
-  test_x += direction_x;
-  test_y += direction_y;
-  
-  // 邊界反彈
-  if (test_x > 2.0 || test_x < 0.0) direction_x = -direction_x;
-  if (test_y > 1.8 || test_y < 0.0) direction_y = -direction_y;
-  
-  if (WiFi.status() == WL_CONNECTED) {
-    udp.beginPacket(udp_address, udp_port);
-    String test_json = "{\"tag_x\":" + String(test_x, 2) + 
-                      ",\"tag_y\":" + String(test_y, 2) + 
-                      ",\"distances\":[" + String(test_x + 0.5, 2) + "," + 
-                      String(test_y + 0.3, 2) + "," + String(test_x + test_y, 2) + "]}";
-    udp.print(test_json);
-    udp.endPacket();
-    Serial.println("測試數據: " + test_json);
-  }
+  response.trim();
+  Serial.println("❌ 指令失敗或超時: " + response);
+  return false;
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial2.begin(115200, SERIAL_8N1, 16, 17);
-  
-  Serial.println("UWB Tag 系統啟動");
-  
+  Serial2.begin(115200, SERIAL_8N1, RXD2, TXD2);
+
   // 連接 WiFi
-  setup_wifi();
-  
-  // 設置 UWB
-  if (WiFi.status() == WL_CONNECTED) {
-    UWB_setupmode();
+  WiFi.begin(ssid, password);
+  Serial.print("📶 Connecting WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
   }
+  Serial.println("\n✅ WiFi Connected: " + WiFi.localIP().toString());
+
+  // 按照文檔正確初始化 UWB Tag
+  Serial.println("⚙️ 初始化 UWB Tag 模組...");
   
-  Serial.println("系統初始化完成");
+  delay(2000); // 等待模組啟動
+  
+  // 1. 重置模組
+  if (!sendCommandAndWait("AT+RST", "OK")) {
+    Serial.println("❌ 重置失敗");
+  }
+  delay(1000);
+  
+  // 2. 設定為 Tag 模式 (model=0) - 這個指令會重新初始化模組
+  Serial.println("🔧 設定 Tag 模式...");
+  Serial2.print("AT+anchor_tag=0\r\n");
+  delay(2000);  // 等待重新初始化完成
+  
+  // 清除所有回應資料
+  while (Serial2.available()) {
+    Serial.print((char)Serial2.read());
+  }
+  Serial.println("\n✅ Tag 模式設定完成");
+  
+  // 3. 設定測距間隔 (5-50)
+  if (!sendCommandAndWait("AT+interval=5", "OK")) {
+    Serial.println("❌ 設定間隔失敗");
+  }
+  delay(500);
+  
+  // 4. 開啟測距功能 (這是關鍵！)
+  if (!sendCommandAndWait("AT+switchdis=1", "OK")) {
+    Serial.println("❌ 開啟測距失敗");
+  }
+  delay(500);
+  
+  // 清除暫存資料
+  while (Serial2.available()) Serial2.read();
+  Serial.println("✅ UWB Tag 初始化完成！開始接收測距數據...");
 }
 
 void loop() {
-  // 檢查 WiFi 連接
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi 斷線，嘗試重連...");
-    setup_wifi();
-    delay(5000);
-    return;
+  static String line = "";
+
+  while (Serial2.available()) {
+    char c = Serial2.read();
+    if (c == '\n' || c == '\r') {
+      if (line.length() > 0) {
+        processLine(line);
+        line = "";
+      }
+    } else {
+      line += c;
+    }
   }
-  
-  // 讀取 UWB 數據
-  UWB_readString();
-  
-  // 如果沒有 UWB 數據，每 5 秒發送一次測試數據
-  static unsigned long last_test = 0;
-  if (millis() - last_test > 5000) {  // 每 5 秒
-    Serial.println("發送測試數據...");
-    send_test_data();
-    last_test = millis();
+}
+
+void processLine(String line) {
+  Serial.println("📥 收到: " + line);
+
+  // 處理實際格式：an0:2.28m, an1:1.72m, an2:1.50m
+  if (line.startsWith("an0:")) {
+    String distStr = line.substring(4);  // 跳過 "an0:"
+    distStr.replace("m", "");           // 移除 "m"
+    dist0 = distStr.toFloat();
+    gotDist0 = true;
+    Serial.printf("🎯 AN0 距離: %.2f\n", dist0);
+  } 
+  else if (line.startsWith("an1:")) {
+    String distStr = line.substring(4);  // 跳過 "an1:"
+    distStr.replace("m", "");           // 移除 "m"
+    dist1 = distStr.toFloat();
+    gotDist1 = true;
+    Serial.printf("🎯 AN1 距離: %.2f\n", dist1);
+  } 
+  else if (line.startsWith("an2:")) {
+    String distStr = line.substring(4);  // 跳過 "an2:"
+    distStr.replace("m", "");           // 移除 "m"
+    dist2 = distStr.toFloat();
+    gotDist2 = true;
+    Serial.printf("🎯 AN2 距離: %.2f\n", dist2);
+    
+    // 當收到 AN2 的距離時，檢查是否三個距離都齊全
+    if (gotDist0 && gotDist1 && gotDist2) {
+      // 計算位置（需要你提供 Anchor 座標）
+      float x = calculatePosition_X(dist0, dist1, dist2);
+      float y = calculatePosition_Y(dist0, dist1, dist2);
+      float z = 0.0;  // 假設在同一平面
+      
+      Serial.printf("📡 計算位置: X=%.2f, Y=%.2f, Z=%.2f\n", x, y, z);
+      
+      // 組成 JSON 傳送
+      String json = "{";
+      json += "\"x\":" + String(x, 2) + ",";
+      json += "\"y\":" + String(y, 2) + ",";
+      json += "\"z\":" + String(z, 2) + ",";
+      json += "\"d0\":" + String(dist0, 2) + ",";
+      json += "\"d1\":" + String(dist1, 2) + ",";
+      json += "\"d2\":" + String(dist2, 2);
+      json += "}";
+
+      // 傳送到 PC
+      udp.beginPacket(udpAddress, udpPort);
+      udp.print(json);
+      udp.endPacket();
+
+      Serial.println("📤 傳送: " + json);
+
+      // 清除旗標，準備下一輪
+      gotDist0 = gotDist1 = gotDist2 = false;
+    }
   }
+}
+
+// 簡單的三邊定位計算函數
+// 你需要根據實際 Anchor 座標來修改這些函數
+float calculatePosition_X(float d0, float d1, float d2) {
+  // 假設 AN0=(0,0), AN1=(5,0), AN2=(2.5,4) 的座標
+  // 這只是範例，請替換成你的實際 Anchor 座標
   
-  delay(100);
+  // 使用三邊定位公式
+  float x1 = 0, y1 = 0;      // AN0 座標
+  float x2 = 5, y2 = 0;      // AN1 座標  
+  float x3 = 2.5, y3 = 4;    // AN2 座標
+  
+  float A = 2*x2 - 2*x1;
+  float B = 2*y2 - 2*y1;
+  float C = pow(d0,2) - pow(d1,2) - pow(x1,2) + pow(x2,2) - pow(y1,2) + pow(y2,2);
+  float D = 2*x3 - 2*x2;
+  float E = 2*y3 - 2*y2;
+  float F = pow(d1,2) - pow(d2,2) - pow(x2,2) + pow(x3,2) - pow(y2,2) + pow(y3,2);
+  
+  float x = (C*E - F*B) / (E*A - B*D);
+  return x;
+}
+
+float calculatePosition_Y(float d0, float d1, float d2) {
+  // 同樣的座標假設
+  float x1 = 0, y1 = 0;      // AN0 座標
+  float x2 = 5, y2 = 0;      // AN1 座標  
+  float x3 = 2.5, y3 = 4;    // AN2 座標
+  
+  float A = 2*x2 - 2*x1;
+  float B = 2*y2 - 2*y1;
+  float C = pow(d0,2) - pow(d1,2) - pow(x1,2) + pow(x2,2) - pow(y1,2) + pow(y2,2);
+  float D = 2*x3 - 2*x2;
+  float E = 2*y3 - 2*y2;
+  float F = pow(d1,2) - pow(d2,2) - pow(x2,2) + pow(x3,2) - pow(y2,2) + pow(y3,2);
+  
+  float y = (A*F - D*C) / (A*E - D*B);
+  return y;
 }
